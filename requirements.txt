@@ -5,3 +5,4 @@ moviepy==1.0.3
 google-genai
 python-dotenv
 ffmpeg-python
+openai

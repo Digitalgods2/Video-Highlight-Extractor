@@ -1,7 +1,80 @@
 from google import genai
+from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 import json
 import os
+
+# Model configurations for each provider
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+OPENAI_MODELS = ["gpt-5.2", "o3-pro", "gpt-5-mini"]
+
+def call_llm(prompt, provider, model, api_key):
+    """
+    Unified wrapper for calling LLM APIs (Gemini or OpenAI).
+    Returns the text response from the model.
+    """
+    if provider == "Google Gemini":
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt
+        )
+        return response.text.strip()
+    
+    elif provider == "OpenAI":
+        client = OpenAI(api_key=api_key)
+        model = model.strip()
+        print(f"DEBUG: Calling OpenAI with model '{model}'")
+        
+        # Base parameters
+        params = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        
+        # Heuristic: O-series (reasoning) vs GPT-series (standard)
+        is_reasoning = model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+        
+        if is_reasoning:
+            params["max_completion_tokens"] = 10000
+            # No temperature for reasoning models
+        else:
+            params["temperature"] = 0.3 if "mini" in model else 0.7
+            params["max_tokens"] = 4096
+
+        try:
+            response = client.chat.completions.create(**params)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            print(f"DEBUG: OpenAI Error: {error_str}")
+            
+            # Catch 1: Temperature unsupported (reasoning model masquerading as standard?)
+            if "temperature" in error_str and "unsupported" in error_str:
+                print("DEBUG: Retrying without temperature...")
+                params.pop("temperature", None)
+                try:
+                    response = client.chat.completions.create(**params)
+                    return response.choices[0].message.content.strip()
+                except Exception:
+                    pass # Fall through to re-raise original or new error
+
+            # Catch 2: max_tokens unsupported (needs max_completion_tokens)
+            if "max_tokens" in error_str and "unsupported" in error_str:
+                print("DEBUG: Retrying with max_completion_tokens...")
+                params.pop("max_tokens", None)
+                params["max_completion_tokens"] = 4096
+                try:
+                    response = client.chat.completions.create(**params)
+                    return response.choices[0].message.content.strip()
+                except Exception:
+                    pass
+            
+            # Re-raise if we couldn't fix it
+            raise e
+    
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 def get_transcript(video_id):
     """
@@ -27,16 +100,159 @@ def get_transcript(video_id):
         print(f"Error fetching transcript: {e}")
         return None
 
-def analyze_humor(transcript, api_key, max_clip_seconds=15, max_clips=5):
+
+def get_transcript_text_for_interval(transcript, start, end):
     """
-    Sends the transcript to Gemini to identify humorous sections.
+    Extracts the combined text from transcript entries that overlap with [start, end].
+    Returns tuple: (combined_text, first_entry_index, last_entry_index)
+    """
+    texts = []
+    first_idx = None
+    last_idx = None
+    
+    for i, entry in enumerate(transcript):
+        entry_start = entry['start']
+        entry_end = entry_start + entry.get('duration', 3)
+        
+        # Check if this entry overlaps with our interval
+        if entry_end >= start and entry_start <= end:
+            texts.append(entry['text'])
+            if first_idx is None:
+                first_idx = i
+            last_idx = i
+    
+    return ' '.join(texts), first_idx, last_idx
+
+
+def validate_clip_completeness(text, api_key, provider="Google Gemini", model="gemini-2.5-flash"):
+    """
+    Asks LLM if the text is a complete thought.
+    Returns tuple: (is_complete: bool, issue: str or None)
+    """
+    prompt = f"""
+    You are checking if a video transcript excerpt is a COMPLETE thought.
+    
+    TEXT: "{text}"
+    
+    Analyze this text and determine:
+    1. Does it START mid-sentence? (missing beginning)
+    2. Does it END mid-sentence? (cut off)
+    3. Is the main idea/joke/point fully expressed?
+    
+    Respond with ONLY valid JSON (no markdown):
+    - If complete: {{"complete": true}}
+    - If incomplete: {{"complete": false, "issue": "starts_mid_sentence" OR "ends_mid_sentence" OR "both"}}
+    """
+    
+    try:
+        text_response = call_llm(prompt, provider, model, api_key)
+        
+        # Clean markdown if present
+        if text_response.startswith("```"):
+            text_response = text_response.split("```")[1]
+            if text_response.startswith("json"):
+                text_response = text_response[4:]
+        text_response = text_response.strip()
+        
+        result = json.loads(text_response)
+        return result.get('complete', True), result.get('issue', None)
+        
+    except Exception as e:
+        print(f"Error validating clip: {e}")
+        return True, None  # Assume complete on error
+
+
+def validate_and_expand_clips(transcript, intervals, api_key, max_clip_seconds, provider="Google Gemini", model="gemini-2.5-flash"):
+    """
+    Validates each clip for completeness and expands boundaries if needed.
+    Loops up to MAX_EXPANSION_PASSES times per clip to handle multi-entry thoughts.
+    DISCARDS clips that cannot be completed within max_clip_seconds (quality over quantity).
+    Returns a new list of (start, end) tuples with corrected timestamps.
+    """
+    MAX_EXPANSION_PASSES = 3
+    validated_intervals = []
+    discarded_count = 0
+    
+    for i, (start, end) in enumerate(intervals):
+        current_start = start
+        current_end = end
+        clip_is_valid = True  # Track if clip should be kept
+        
+        for pass_num in range(MAX_EXPANSION_PASSES):
+            # Get the text for this interval
+            text, first_idx, last_idx = get_transcript_text_for_interval(transcript, current_start, current_end)
+            
+            if not text or first_idx is None:
+                print(f"Clip {i+1}: No transcript text found, discarding")
+                clip_is_valid = False
+                break
+            
+            # Check completeness
+            is_complete, issue = validate_clip_completeness(text, api_key, provider, model)
+            
+            if is_complete:
+                if pass_num == 0:
+                    print(f"Clip {i+1}: Complete ✓")
+                else:
+                    print(f"Clip {i+1}: Complete after {pass_num} expansion(s) ✓")
+                break
+            
+            if pass_num == 0:
+                print(f"Clip {i+1}: Incomplete ({issue}) - expanding...")
+            else:
+                print(f"  Pass {pass_num + 1}: Still incomplete ({issue}) - expanding more...")
+            
+            expanded = False
+            
+            # Expand backwards if starts mid-sentence
+            if issue in ['starts_mid_sentence', 'both']:
+                if first_idx > 0:
+                    prev_entry = transcript[first_idx - 1]
+                    new_start = prev_entry['start']
+                    if new_start < current_start:
+                        print(f"  Expanded start: {current_start:.1f}s -> {new_start:.1f}s")
+                        current_start = new_start
+                        expanded = True
+            
+            # Expand forwards if ends mid-sentence
+            if issue in ['ends_mid_sentence', 'both']:
+                if last_idx < len(transcript) - 1:
+                    next_entry = transcript[last_idx + 1]
+                    new_end = next_entry['start'] + next_entry.get('duration', 3)
+                    if new_end > current_end:
+                        print(f"  Expanded end: {current_end:.1f}s -> {new_end:.1f}s")
+                        current_end = new_end
+                        expanded = True
+            
+            # If we couldn't expand further, stop trying
+            if not expanded:
+                print(f"  Cannot expand further (at transcript boundary) - DISCARDING")
+                clip_is_valid = False
+                break
+            
+            # Check if we've hit max clip length - DISCARD instead of clamp
+            if current_end - current_start > max_clip_seconds:
+                print(f"  Exceeded max {max_clip_seconds}s and still incomplete - DISCARDING (quality over quantity)")
+                clip_is_valid = False
+                break
+        
+        if clip_is_valid:
+            validated_intervals.append((current_start, current_end))
+        else:
+            discarded_count += 1
+    
+    if discarded_count > 0:
+        print(f"\n🗑️ Discarded {discarded_count} clips that couldn't be completed within {max_clip_seconds}s")
+    
+    return validated_intervals
+
+def analyze_humor(transcript, api_key, max_clip_seconds=15, max_clips=5, provider="Google Gemini", model="gemini-2.5-flash"):
+    """
+    Sends the transcript to LLM to identify humorous sections.
     Returns a list of (start, end) tuples.
     """
     if not api_key:
         raise ValueError("API Key is required")
-    
-    # Create client with the new SDK
-    client = genai.Client(api_key=api_key)
 
     # Prepare transcript for prompt - include start AND end times with clear labels
     formatted_transcript = ""
@@ -79,25 +295,23 @@ def analyze_humor(transcript, api_key, max_clip_seconds=15, max_clips=5):
     4. BE HONEST with your humor_score - do not inflate scores. Only rate 8+ if it's GENUINELY funny.
     5. REASONING IS REQUIRED: You must explain in 1 sentence WHY this specific moment is funny.
     
-    CRITICAL QUANTITY RULES:
+    CRITICAL QUANTITY RULES (READ THIS CAREFULLY):
     - {max_clips} is the ABSOLUTE MAXIMUM, NOT a target or goal
-    - NEVER return exactly {max_clips} clips just because that's the limit
+    - NEVER return exactly {max_clips} clips - if you return exactly {max_clips}, you are probably padding
     - Return ONLY clips that are genuinely funny - if only 2 moments are funny, return only 2
-    - IT IS BETTER TO RETURN 3 GREAT CLIPS THAN 10 MEDIOCRE ONES
+    - IT IS BETTER TO RETURN 3 GREAT CLIPS THAN {max_clips} MEDIOCRE ONES
     - DO NOT pad with low-quality content to fill the quota
     - If the video has no funny moments, return an EMPTY list []
     - Be RUTHLESSLY selective - when in doubt, leave it out
+    - Ask yourself: "Would I actually share this clip?" If not, DON'T INCLUDE IT
+    - Most videos have 5-10 genuinely funny moments at most, not {max_clips}
     
     Here is the transcript:
     {formatted_transcript}
     """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        text_response = response.text.strip()
+        text_response = call_llm(prompt, provider, model, api_key)
         
         # Cleanup if model adds markdown
         if text_response.startswith("```json"):
@@ -153,6 +367,11 @@ def analyze_humor(transcript, api_key, max_clip_seconds=15, max_clips=5):
         
         if filtered_count > 0:
             print(f"Filtered out {filtered_count} clips with humor_score below {MINIMUM_HUMOR_SCORE}")
+
+        # Hard limit based on user setting
+        if len(results) > max_clips:
+            print(f"Enforcing max limit: Trimming {len(results)} clips down to {max_clips}")
+            results = results[:max_clips]
             
         return results
 
@@ -161,16 +380,13 @@ def analyze_humor(transcript, api_key, max_clip_seconds=15, max_clips=5):
         # Return empty list on failure so the app doesn't crash
         return []
 
-def analyze_quotes(transcript, api_key, max_clip_seconds=15, max_clips=5):
+def analyze_quotes(transcript, api_key, max_clip_seconds=15, max_clips=5, provider="Google Gemini", model="gemini-2.5-flash"):
     """
-    Sends the transcript to Gemini to identify memorable quotes.
+    Sends the transcript to LLM to identify memorable quotes.
     Returns a list of (start, end) tuples.
     """
     if not api_key:
         raise ValueError("API Key is required")
-    
-    # Create client with the new SDK
-    client = genai.Client(api_key=api_key)
 
     # Prepare transcript for prompt - include start AND end times with clear labels
     formatted_transcript = ""
@@ -236,15 +452,17 @@ def analyze_quotes(transcript, api_key, max_clip_seconds=15, max_clips=5):
     - Questions without memorable answers
     - Anything that requires context from before/after to understand
     
-    CRITICAL QUANTITY RULES:
+    CRITICAL QUANTITY RULES (READ THIS CAREFULLY):
     - {max_clips} is the ABSOLUTE MAXIMUM, NOT a target or goal
-    - NEVER return exactly {max_clips} clips just because that's the limit
+    - NEVER return exactly {max_clips} clips - if you return exactly {max_clips}, you are probably padding
     - Return ONLY clips that genuinely meet the criteria above
-    - IT IS BETTER TO RETURN 3 GREAT CLIPS THAN 10 MEDIOCRE ONES
+    - IT IS BETTER TO RETURN 3 GREAT CLIPS THAN {max_clips} MEDIOCRE ONES
     - DO NOT pad with low-quality content to fill the quota
     - If only 2 moments qualify, return only 2
     - If the video has no qualifying moments, return an EMPTY list []
     - Be RUTHLESSLY selective - when in doubt, leave it out
+    - Ask yourself: "Would I actually share this clip?" If not, DON'T INCLUDE IT
+    - Most videos have 5-10 genuinely quotable moments at most, not {max_clips}
     - Each clip MUST be {max_clip_seconds} seconds or less
     
     Here is the transcript:
@@ -252,11 +470,7 @@ def analyze_quotes(transcript, api_key, max_clip_seconds=15, max_clips=5):
     """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        text_response = response.text.strip()
+        text_response = call_llm(prompt, provider, model, api_key)
         
         # Cleanup if model adds markdown
         if text_response.startswith("```json"):
@@ -308,6 +522,11 @@ def analyze_quotes(transcript, api_key, max_clip_seconds=15, max_clips=5):
         
         if filtered_count > 0:
             print(f"Filtered out {filtered_count} quotes with quality_score below {MINIMUM_QUALITY_SCORE}")
+            
+        # Hard limit based on user setting
+        if len(results) > max_clips:
+            print(f"Enforcing max limit: Trimming {len(results)} clips down to {max_clips}")
+            results = results[:max_clips]
             
         return results
 

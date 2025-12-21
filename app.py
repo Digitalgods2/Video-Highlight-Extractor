@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import re
 from dotenv import load_dotenv
-from analysis_utils import get_transcript, analyze_humor, analyze_quotes
+from analysis_utils import get_transcript, analyze_humor, analyze_quotes, validate_and_expand_clips
 from video_utils import download_video, create_gag_reel, create_single_clip, PRE_ROLL_BUFFER, POST_ROLL_BUFFER
 
 # Load env vars
@@ -16,15 +16,15 @@ def extract_video_id(url):
         return match.group(1)
     return None
 
-def run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips):
+def run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips, provider, model):
     """
     Runs the appropriate analysis (humor or quotes) based on extraction_mode.
     Returns a list of (start, end) tuples, or None if no clips found.
     """
     if extraction_mode == "😂 Funny Moments":
-        return analyze_humor(transcript, api_key, max_clip_seconds, max_clips)
+        return analyze_humor(transcript, api_key, max_clip_seconds, max_clips, provider, model)
     else:
-        return analyze_quotes(transcript, api_key, max_clip_seconds, max_clips)
+        return analyze_quotes(transcript, api_key, max_clip_seconds, max_clips, provider, model)
 
 def main():
     st.set_page_config(page_title="Video Highlight Extractor", page_icon="🎬", layout="wide")
@@ -47,19 +47,51 @@ def main():
     
     st.title("🎬 Video Highlight Extractor")
     
-    # Sidebar for API Configuration
+    # Model configurations
+    GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+    OPENAI_MODELS = ["gpt-5.2", "gpt-4o"]
+    
+    # Sidebar for Configuration
     with st.sidebar:
         st.header("Configuration")
         
-        default_key = os.getenv("GEMINI_API_KEY", "")
-        api_key = st.text_input("Gemini API Key", value=default_key, type="password")
-        
-        if st.button("Save API Key"):
-            if api_key:
+        # Settings Section
+        with st.expander("⚙️ Settings", expanded=True):
+            # Provider Selection
+            provider = st.selectbox(
+                "AI Provider",
+                ["Google Gemini", "OpenAI"],
+                index=0
+            )
+            
+            # Model Selection (changes based on provider)
+            if provider == "Google Gemini":
+                model = st.selectbox("Model", GEMINI_MODELS, index=0)
+            else:
+                model = st.selectbox("Model", OPENAI_MODELS, index=0)
+            
+            st.divider()
+            
+            # API Keys
+            default_gemini_key = os.getenv("GEMINI_API_KEY", "")
+            default_openai_key = os.getenv("OPENAI_API_KEY", "")
+            
+            gemini_key = st.text_input("Gemini API Key", value=default_gemini_key, type="password")
+            openai_key = st.text_input("OpenAI API Key", value=default_openai_key, type="password")
+            
+            if st.button("💾 Save API Keys"):
                 with open(".env", "w") as f:
-                    f.write(f"GEMINI_API_KEY={api_key}")
-                st.success("Saved!")
-                os.environ["GEMINI_API_KEY"] = api_key
+                    f.write(f"GEMINI_API_KEY={gemini_key}\n")
+                    f.write(f"OPENAI_API_KEY={openai_key}\n")
+                os.environ["GEMINI_API_KEY"] = gemini_key
+                os.environ["OPENAI_API_KEY"] = openai_key
+                st.success("API Keys saved!")
+        
+        # Get the active API key based on provider
+        if provider == "Google Gemini":
+            api_key = gemini_key
+        else:
+            api_key = openai_key
         
         st.divider()
         st.subheader("Extraction Mode")
@@ -115,13 +147,17 @@ def main():
                 
                 # Analyze for clips using helper function
                 with st.spinner("Analyzing transcript..."):
-                    intervals = run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips)
+                    intervals = run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips, provider, model)
                 
                 if not intervals:
                     st.warning("No clips found with current settings. Try adjusting the slider or changing modes.")
                     return
                 
-                st.success(f"Found {len(intervals)} clips!")
+                # Validate and expand clips for completeness
+                with st.spinner(f"Validating {len(intervals)} clips for completeness..."):
+                    intervals = validate_and_expand_clips(transcript, intervals, api_key, max_clip_seconds, provider, model)
+                
+                st.success(f"Found {len(intervals)} validated clips!")
                 st.session_state.found_intervals = intervals
                 # Reset selections and specific previews regarding new intervals
                 st.session_state.selected_clips = {i: True for i in range(len(intervals))}
@@ -172,13 +208,17 @@ def main():
                 
                 # Analyze for clips FIRST (before downloading)
                 with st.spinner("Analyzing transcript..."):
-                    intervals = run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips)
+                    intervals = run_clip_analysis(transcript, extraction_mode, api_key, max_clip_seconds, max_clips, provider, model)
                 
                 if not intervals:
                     st.warning("No clips found in this video. Try a different video or adjust settings.")
                     return
                 
-                st.success(f"Found {len(intervals)} potential clips! Downloading video...")
+                # Validate and expand clips for completeness
+                with st.spinner(f"Validating {len(intervals)} clips for completeness..."):
+                    intervals = validate_and_expand_clips(transcript, intervals, api_key, max_clip_seconds, provider, model)
+                
+                st.success(f"Found {len(intervals)} validated clips! Downloading video...")
                 
                 # Download video ONLY if clips were found
                 with st.spinner("Downloading video..."):

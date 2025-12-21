@@ -4,25 +4,30 @@ An AI-powered application that takes a YouTube video URL, analyzes its transcrip
 
 ## Features
 
+- **Dual AI Providers:**
+  - 🤖 **Google Gemini** - Fast, reliable (Gemini 2.5 Flash/Pro)
+  - 🧠 **OpenAI** - Powerful reasoning (GPT-5.2, GPT-4o)
+- **Settings Dashboard**: Configure providers, models, and API keys in one place
 - **Two Extraction Modes:**
   - 😂 **Funny Moments** - Creates a gag reel of the funniest sections
   - 💬 **Memorable Quotes** - Extracts profound, clever, weird, or quotable moments
-- **AI Quality Scoring**: Each clip is rated 1-10 with reasoning; only 8+ clips are kept
+- **Smart Validation**: AI verifies and expands clips to ensure complete thoughts (no cut-off sentences)
+- **Quality Filtering**: Scored 1-10; strictly enforces "quality over quantity" (bad clips are discarded)
 - **Clip Preview & Selection**: Preview all detected clips before stitching; uncheck any you don't want
-- **Smart Transcript Handling**: Auto-fetches transcripts or accepts manual input with timestamps
-- **Re-Analyze Without Re-Downloading**: Switch modes or tweak settings instantly using cached video
+- **Re-Analyze Without Re-Downloading**: Switch models or tweak settings instantly using cached video
 - **Configurable Settings**:
   - Max clip length (5-60 seconds)
   - Max number of clips (3-50)
-- **FFmpeg-Accelerated Previews**: Fast clip extraction using direct FFmpeg seeking
 - **Context Buffers**: Clips include 0.5s pre-roll and 2.0s post-roll for complete sentences
-- **API Key Persistence**: Save your Gemini API key to `.env` for convenience
+- **API Key Persistence**: Save both keys to `.env` for convenience
 
 ## Prerequisites
 
 - **Python 3.8+**
 - **FFmpeg**: Must be installed and in your PATH ([Download](https://ffmpeg.org/download.html))
-- **Gemini API Key**: Free at [Google AI Studio](https://aistudio.google.com/)
+- **API Keys**:
+  - [Google Gemini API Key](https://aistudio.google.com/) (Free tier available)
+  - [OpenAI API Key](https://platform.openai.com/) (Optional, for GPT models)
 
 ## Installation
 
@@ -53,16 +58,18 @@ An AI-powered application that takes a YouTube video URL, analyzes its transcrip
    streamlit run app.py
    ```
 
-2. In the sidebar:
-   - Enter your **Gemini API Key**
-   - Choose **Extraction Mode** (Funny Moments or Memorable Quotes)
-   - Adjust **Clip Settings** (length, count)
+2. Open the **⚙️ Settings** expander in the sidebar:
+   - Select **AI Provider** (Google Gemini or OpenAI)
+   - Choose your **Model** (e.g., `gpt-4o`, `gemini-2.5-flash`)
+   - Enter and Save your **API Keys**
 
-3. Paste a **YouTube URL** and click **🔍 Find Clips**
+3. Choose **Extraction Mode** (Funny Moments or Memorable Quotes) & adjust settings.
 
-4. **Preview & Select**: Watch each clip, uncheck any duds
+4. Paste a **YouTube URL** and click **🔍 Find Clips**.
 
-5. Click **🎬 Stitch Selected Clips** to generate your reel
+5. **Preview & Select**: Watch each clip, uncheck any duds.
+
+6. Click **🎬 Stitch Selected Clips** to generate your reel.
 
 6. Download the final video!
 
