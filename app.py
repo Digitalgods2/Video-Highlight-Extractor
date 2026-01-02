@@ -48,8 +48,9 @@ def main():
     st.title("🎬 Video Highlight Extractor")
     
     # Model configurations
-    GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
-    OPENAI_MODELS = ["gpt-5.2", "gpt-4o"]
+    GEMINI_MODELS = ["gemini-3-pro", "gemini-3-flash", "gemini-3-deep-think"]
+    OPENAI_MODELS = ["gpt-5.2", "gpt-5.1", "gpt-5-mini", "o3-pro", "o4-mini"]
+    ANTHROPIC_MODELS = ["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
     
     # Sidebar for Configuration
     with st.sidebar:
@@ -60,38 +61,46 @@ def main():
             # Provider Selection
             provider = st.selectbox(
                 "AI Provider",
-                ["Google Gemini", "OpenAI"],
+                ["Google Gemini", "OpenAI", "Anthropic"],
                 index=0
             )
             
             # Model Selection (changes based on provider)
             if provider == "Google Gemini":
                 model = st.selectbox("Model", GEMINI_MODELS, index=0)
-            else:
+            elif provider == "OpenAI":
                 model = st.selectbox("Model", OPENAI_MODELS, index=0)
+            else:  # Anthropic
+                model = st.selectbox("Model", ANTHROPIC_MODELS, index=0)
             
             st.divider()
             
             # API Keys
             default_gemini_key = os.getenv("GEMINI_API_KEY", "")
             default_openai_key = os.getenv("OPENAI_API_KEY", "")
+            default_anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
             
             gemini_key = st.text_input("Gemini API Key", value=default_gemini_key, type="password")
             openai_key = st.text_input("OpenAI API Key", value=default_openai_key, type="password")
+            anthropic_key = st.text_input("Anthropic API Key", value=default_anthropic_key, type="password")
             
             if st.button("💾 Save API Keys"):
                 with open(".env", "w") as f:
                     f.write(f"GEMINI_API_KEY={gemini_key}\n")
                     f.write(f"OPENAI_API_KEY={openai_key}\n")
+                    f.write(f"ANTHROPIC_API_KEY={anthropic_key}\n")
                 os.environ["GEMINI_API_KEY"] = gemini_key
                 os.environ["OPENAI_API_KEY"] = openai_key
+                os.environ["ANTHROPIC_API_KEY"] = anthropic_key
                 st.success("API Keys saved!")
         
         # Get the active API key based on provider
         if provider == "Google Gemini":
             api_key = gemini_key
-        else:
+        elif provider == "OpenAI":
             api_key = openai_key
+        else:  # Anthropic
+            api_key = anthropic_key
         
         st.divider()
         st.subheader("Extraction Mode")
@@ -144,6 +153,7 @@ def main():
             if confirm_rerun:
                 # Reuse cached data
                 transcript = st.session_state.cached_transcript
+                input_url = st.session_state.cached_url
                 
                 # Analyze for clips using helper function
                 with st.spinner("Analyzing transcript..."):
@@ -156,6 +166,20 @@ def main():
                 # Validate and expand clips for completeness
                 with st.spinner(f"Validating {len(intervals)} clips for completeness..."):
                     intervals = validate_and_expand_clips(transcript, intervals, api_key, max_clip_seconds, provider, model)
+                
+                if not intervals:
+                    st.warning("All clips were discarded during validation. Try increasing the max clip length.")
+                    return
+                
+                # Ensure video is downloaded (may be missing if session expired or file deleted)
+                video_path = st.session_state.cached_video_path
+                if not video_path or not os.path.exists(video_path):
+                    with st.spinner("Downloading video..."):
+                        video_path = download_video(input_url)
+                        if not video_path:
+                            st.error("Failed to download video.")
+                            return
+                        st.session_state.cached_video_path = video_path
                 
                 st.success(f"Found {len(intervals)} validated clips!")
                 st.session_state.found_intervals = intervals
@@ -218,6 +242,10 @@ def main():
                 with st.spinner(f"Validating {len(intervals)} clips for completeness..."):
                     intervals = validate_and_expand_clips(transcript, intervals, api_key, max_clip_seconds, provider, model)
                 
+                if not intervals:
+                    st.warning("All clips were discarded during validation. Try increasing the max clip length.")
+                    return
+                
                 st.success(f"Found {len(intervals)} validated clips! Downloading video...")
                 
                 # Download video ONLY if clips were found
@@ -241,8 +269,16 @@ def main():
         intervals = st.session_state.found_intervals
         video_path = st.session_state.cached_video_path
         
+        # Debug logging
+        print(f"DEBUG Step 2: intervals={intervals}, video_path={video_path}")
+        
         if not intervals or not video_path:
-            st.error("No clips found. Please start over.")
+            missing = []
+            if not intervals:
+                missing.append("clips")
+            if not video_path:
+                missing.append("video path")
+            st.error(f"Missing: {', '.join(missing)}. Please start over.")
             st.session_state.step = 1
             return
         

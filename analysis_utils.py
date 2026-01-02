@@ -1,30 +1,62 @@
 from google import genai
 from openai import OpenAI
+import anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
 import json
 import os
 
 # Model configurations for each provider
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
-OPENAI_MODELS = ["gpt-5.2", "o3-pro", "gpt-5-mini"]
+GEMINI_MODELS = ["gemini-3-pro", "gemini-3-flash", "gemini-3-deep-think"]
+OPENAI_MODELS = ["gpt-5.2", "gpt-5.1", "gpt-5-mini", "o3-pro", "o4-mini"]
+ANTHROPIC_MODELS = ["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
 
 def call_llm(prompt, provider, model, api_key):
     """
-    Unified wrapper for calling LLM APIs (Gemini or OpenAI).
+    Unified wrapper for calling LLM APIs (Gemini, OpenAI, or Anthropic).
     Returns the text response from the model.
     """
     if provider == "Google Gemini":
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt
-        )
-        return response.text.strip()
+        print(f"DEBUG: Calling Gemini with model '{model}'")
+        
+        # Gemini 3 uses generation_config for output control
+        # Deep Think models may need special handling
+        is_deep_think = "deep-think" in model.lower()
+        
+        config = {
+            "max_output_tokens": 8192,
+            "temperature": 0.7 if not is_deep_think else None,  # Deep Think uses internal reasoning
+        }
+        # Remove None values
+        config = {k: v for k, v in config.items() if v is not None}
+        
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"DEBUG: Gemini Error: {e}")
+            # Fallback without config if it fails
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+                return response.text.strip()
+            except Exception:
+                raise e
     
     elif provider == "OpenAI":
         client = OpenAI(api_key=api_key)
         model = model.strip()
         print(f"DEBUG: Calling OpenAI with model '{model}'")
+        
+        # Determine model type for parameter selection
+        is_reasoning = model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+        is_gpt5 = model.startswith("gpt-5")
         
         # Base parameters
         params = {
@@ -32,14 +64,18 @@ def call_llm(prompt, provider, model, api_key):
             "messages": [{"role": "user", "content": prompt}],
         }
         
-        # Heuristic: O-series (reasoning) vs GPT-series (standard)
-        is_reasoning = model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
-        
+        # GPT-5 series and reasoning models use max_completion_tokens
+        # Reasoning models don't support temperature
         if is_reasoning:
             params["max_completion_tokens"] = 10000
             # No temperature for reasoning models
-        else:
+        elif is_gpt5:
+            # GPT-5 uses max_completion_tokens (not max_tokens)
+            params["max_completion_tokens"] = 8192
             params["temperature"] = 0.3 if "mini" in model else 0.7
+        else:
+            # Legacy models (gpt-4o, etc.) use max_tokens
+            params["temperature"] = 0.7
             params["max_tokens"] = 4096
 
         try:
@@ -49,7 +85,7 @@ def call_llm(prompt, provider, model, api_key):
             error_str = str(e).lower()
             print(f"DEBUG: OpenAI Error: {error_str}")
             
-            # Catch 1: Temperature unsupported (reasoning model masquerading as standard?)
+            # Catch 1: Temperature unsupported (reasoning model)
             if "temperature" in error_str and "unsupported" in error_str:
                 print("DEBUG: Retrying without temperature...")
                 params.pop("temperature", None)
@@ -57,13 +93,13 @@ def call_llm(prompt, provider, model, api_key):
                     response = client.chat.completions.create(**params)
                     return response.choices[0].message.content.strip()
                 except Exception:
-                    pass # Fall through to re-raise original or new error
+                    pass
 
             # Catch 2: max_tokens unsupported (needs max_completion_tokens)
             if "max_tokens" in error_str and "unsupported" in error_str:
                 print("DEBUG: Retrying with max_completion_tokens...")
                 params.pop("max_tokens", None)
-                params["max_completion_tokens"] = 4096
+                params["max_completion_tokens"] = 8192
                 try:
                     response = client.chat.completions.create(**params)
                     return response.choices[0].message.content.strip()
@@ -71,6 +107,30 @@ def call_llm(prompt, provider, model, api_key):
                     pass
             
             # Re-raise if we couldn't fix it
+            raise e
+    
+    elif provider == "Anthropic":
+        print(f"DEBUG: Calling Anthropic with model '{model}'")
+        
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            
+            # Anthropic Claude API uses messages format
+            # max_tokens is required for Claude (controls output length)
+            response = client.messages.create(
+                model=model,
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            # Extract text from response content blocks
+            return response.content[0].text.strip()
+            
+        except anthropic.APIError as e:
+            print(f"DEBUG: Anthropic API Error: {e}")
+            raise e
+        except Exception as e:
+            print(f"DEBUG: Anthropic Error: {e}")
             raise e
     
     else:
